@@ -1,0 +1,145 @@
+use std::collections::HashMap;
+
+use tokio::{sync::{broadcast, oneshot, mpsc}, spawn};
+
+#[derive(Clone)]
+pub struct Notification {
+    text: Vec<u8>
+} 
+
+#[derive(PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Copy)]
+pub struct RoomID(u64);
+
+#[derive(PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Copy)]
+pub struct UserID(u64);
+
+pub struct Room {
+    id: RoomID,
+
+    // TODO: A layer of indirection between the mailbox and the users.
+    // The channel coroutine should contain its own private state
+    mailbox: mpsc::Sender<Notification>,
+    outgoing: broadcast::Sender<Notification>,
+    cancel: oneshot::Sender<()>,
+    forwarding: HashMap<UserID, ForwardingTask>,
+}
+
+pub struct User {
+    id: UserID,
+
+    mailbox: mpsc::Sender<(RoomID, Notification)>,
+    cancel: oneshot::Sender<()>,
+    send_handles: HashMap<RoomID, mpsc::Sender<Notification>>,
+}
+
+struct ForwardingTask {
+    send_cancel: oneshot::Sender<()>,
+}
+
+impl Room {
+    pub fn new(id: RoomID) -> Self {
+        let (mailbox, ingoing) = mpsc::channel(1);
+        let (outgoing, _) = broadcast::channel(256);
+        let (cancel, receive_cancel) = oneshot::channel();
+
+        tokio::spawn(Room::flow(ingoing, outgoing.clone(), receive_cancel));
+
+        Room { 
+            id,
+            mailbox, 
+            outgoing,
+            cancel,
+
+            forwarding: HashMap::new(),
+        }
+    }
+
+    pub fn join(&mut self, user: &mut User) {
+        // send messages from channel to user 
+        let (send_cancel, receive_cancel) = oneshot::channel();
+
+        if self.forwarding.contains_key(&user.id) { return; }
+
+        let me_id = self.id;
+        let from_me = self.outgoing.subscribe();
+        let to_user = user.mailbox.clone();
+        spawn(async move {
+            tokio::pin!(receive_cancel);
+            tokio::pin!(from_me);
+            tokio::pin!(to_user);
+            loop {
+                tokio::select! {
+                    _ = &mut receive_cancel => { return }
+                    x = from_me.recv() => match x {
+                        Ok(msg) => { 
+                            match to_user.send((me_id, msg)).await {
+                                Ok(()) => (),
+                                Err(_) => { return }
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                            // well that sucks. right now do nothing
+                            eprintln!("lagged!");
+                        }
+                        Err(broadcast::error::RecvError::Closed) => { return }
+                    }
+                };
+            }
+        });
+
+        assert!(self.forwarding.insert(user.id, ForwardingTask {send_cancel}).is_none());
+
+        // allow users to send messages from user to channel
+        // TODO: The user should really do this themselves when they receive a join
+        let to_me = self.mailbox.clone();
+        user.send_handles.insert(self.id, to_me);
+
+        // TODO: Send myself a join
+    }
+
+    pub fn part(&mut self, user: &mut User) {
+        // stop sending messages from channel to user
+        if let Some(f) = self.forwarding.remove(&user.id) {
+            match f.send_cancel.send(()) { Ok(()) => {}, Err(()) => {} }
+        }
+
+        // stop letting user send messages to me
+        // TODO: The user should really do this themselves when they receive a part
+        user.send_handles.remove(&self.id);
+
+        // TODO: Send myself a part
+    }
+
+    // TODO: Kill a channel
+    pub fn kill(self) {
+        panic!("TODO: part all users");
+        // TODO: 
+        match self.cancel.send(()) {
+            Ok(()) => (),
+            Err(()) => (),
+        }
+    }
+
+    async fn flow(
+        mut ingoing: mpsc::Receiver<Notification>, 
+        outgoing: broadcast::Sender<Notification>, 
+        mut cancel: oneshot::Receiver<()>,
+    ) {
+        loop {
+            let not = tokio::select! {
+                _ = &mut cancel => { return },
+                n = ingoing.recv() => match n {
+                    Some(x) => { x }
+                    None => { return }
+                }
+            };
+
+            // TODO: Make sure the user is actually here and stuff
+
+            match outgoing.send(not) {
+                Ok(_) => { }
+                Err(_) => return
+            }
+        }
+    }
+}
